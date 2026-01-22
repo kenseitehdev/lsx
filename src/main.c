@@ -1,7 +1,3 @@
-// lsx.c - lazygit-ish ls clone with boxed UI + safer memory + file-path support
-// Build: clang -O2 -Wall -Wextra -pedantic lsx.c -o lsx
-// Debug: clang -g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer lsx.c -o lsx
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +14,6 @@
 #define MAX_PATH 4096
 #define MAX_ITEMS 2048
 
-// ANSI color codes
 #define COLOR_RESET    "\033[0m"
 #define COLOR_CYAN     "\033[36m"
 #define COLOR_GREEN    "\033[32m"
@@ -28,27 +23,39 @@
 #define COLOR_RED      "\033[31m"
 #define COLOR_BOLD     "\033[1m"
 #define COLOR_BG_CYAN  "\033[46;30m"
-
-// extra styling (lazygit-ish)
 #define COLOR_WHITE    "\033[97m"
 #define COLOR_GRAY     "\033[37m"
 #define COLOR_DIM      "\033[2m"
 
 typedef struct {
-    int show_hidden;      // -a
-    int long_format;      // -l
-    int human_readable;   // -h
-    int omit_group;       // -g
-    int add_slash;        // -F
-    int show_inode;       // -i
-    int recursive;        // -R
-    int reverse;          // -r
-    int sort_by_ext;      // -X
-    int sort_by_time;     // -t
-    int numeric_ids;      // -n
-    int comma_separated;  // -m
-    int quote_names;      // -Q
-    char *pattern;        // *.ext
+    int show_hidden;      
+
+    int long_format;      
+
+    int human_readable;   
+
+    int omit_group;       
+
+    int add_slash;        
+
+    int show_inode;       
+
+    int recursive;        
+
+    int reverse;          
+
+    int sort_by_ext;      
+
+    int sort_by_time;     
+
+    int numeric_ids;      
+
+    int comma_separated;  
+
+    int quote_names;      
+
+    char *pattern;        
+
 } Options;
 
 typedef struct {
@@ -72,20 +79,24 @@ typedef struct {
 
 static Options opts = {0};
 
-// --- Box drawing (UTF-8 bytes) + ASCII fallback ---
 static int g_use_utf8 = 1;
 
-// UTF-8 box drawing bytes
-#define U8_H  "\xE2\x94\x80" // ─
-#define U8_V  "\xE2\x94\x82" // │
-#define U8_TL "\xE2\x94\x8C" // ┌
-#define U8_TR "\xE2\x94\x90" // ┐
-#define U8_BL "\xE2\x94\x94" // └
-#define U8_BR "\xE2\x94\x98" // ┘
-#define U8_LJ "\xE2\x94\x9C" // ├
-#define U8_RJ "\xE2\x94\xA4" // ┤
+#define U8_H  "\xE2\x94\x80" 
 
-// ASCII fallback
+#define U8_V  "\xE2\x94\x82" 
+
+#define U8_TL "\xE2\x94\x8C" 
+
+#define U8_TR "\xE2\x94\x90" 
+
+#define U8_BL "\xE2\x94\x94" 
+
+#define U8_BR "\xE2\x94\x98" 
+
+#define U8_LJ "\xE2\x94\x9C" 
+
+#define U8_RJ "\xE2\x94\xA4" 
+
 #define A_H  "-"
 #define A_V  "|"
 #define A_TL "+"
@@ -122,7 +133,6 @@ static void init_glyphs(void) {
     }
 }
 
-// --- UI helpers ---
 static void print_repeat(const char *s, int n) {
     for (int i = 0; i < n; i++) fputs(s, stdout);
 }
@@ -146,7 +156,7 @@ static void print_border_bottom(int width) {
 }
 
 static void print_row_prefix(void) {
-    // counts as 1 visible column (the trailing space)
+
     printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
 }
 
@@ -211,7 +221,6 @@ static int load_directory(FileList *list, const char *path) {
     return 0;
 }
 
-// Create a "list" for a single file path
 static int load_single_file(FileList *list, const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
@@ -299,7 +308,6 @@ static void format_time(time_t t, char *str, size_t len) {
     strftime(str, len, "%b %d %H:%M", tmv);
 }
 
-// permission highlighting (prints EXACTLY 10 visible chars)
 static void print_perms_colored(mode_t mode) {
     char t = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
     const char *tcol = S_ISDIR(mode) ? (COLOR_CYAN COLOR_BOLD)
@@ -328,13 +336,11 @@ static void print_perms_colored(mode_t mode) {
     }
 }
 
-// --- Boxed SIMPLE mode (ONE ITEM PER LINE) ---
 static void draw_simple_box(FileList *list) {
     int width = 120;
 
     print_border_top(width);
 
-    // title
     printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
     printf("%s%slsx%s %s", COLOR_BG_CYAN, COLOR_BOLD, COLOR_RESET, list->cwd);
     int title_visible = 1 + (int)strlen("lsx ") + (int)strlen(list->cwd);
@@ -342,7 +348,6 @@ static void draw_simple_box(FileList *list) {
 
     print_border_mid(width);
 
-    // one item per line
     for (int i = 0; i < list->count; i++) {
         FileItem *item = &list->items[i];
 
@@ -357,11 +362,9 @@ static void draw_simple_box(FileList *list) {
         print_row_prefix();
         int used = 1;
 
-        // icon + space
         printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
         used += 2;
 
-        // name (quoted or not)
         printf("%s", name_col);
         if (opts.quote_names) {
             printf("\"%s\"", item->name);
@@ -371,7 +374,6 @@ static void draw_simple_box(FileList *list) {
             used += (int)strlen(item->name);
         }
 
-        // trailing slash
         if (opts.add_slash && item->is_dir) {
             printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET);
             used += 1;
@@ -386,13 +388,11 @@ static void draw_simple_box(FileList *list) {
     printf("%s  %d items total%s\n", COLOR_DIM COLOR_GRAY, list->count, COLOR_RESET);
 }
 
-// --- Boxed LONG mode (table) ---
 static void draw_long_format(FileList *list) {
     int width = 120;
 
     print_border_top(width);
 
-    // Title row
     printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
     printf("%s%slsx%s %s", COLOR_BG_CYAN, COLOR_BOLD, COLOR_RESET, list->cwd);
     int title_visible = 1 + (int)strlen("lsx ") + (int)strlen(list->cwd);
@@ -400,7 +400,6 @@ static void draw_long_format(FileList *list) {
 
     print_border_mid(width);
 
-    // Headers
     print_row_prefix();
     int used = 1;
 
@@ -438,7 +437,6 @@ static void draw_long_format(FileList *list) {
 
     print_border_mid(width);
 
-    // Rows
     time_t now = time(NULL);
 
     for (int i = 0; i < list->count; i++) {
@@ -456,7 +454,6 @@ static void draw_long_format(FileList *list) {
         printf(" ");
         used += 11;
 
-        // OWNER
         if (opts.numeric_ids) {
             printf("%s%-8u%s ", COLOR_CYAN, item->uid, COLOR_RESET);
             used += 9;
@@ -469,7 +466,6 @@ static void draw_long_format(FileList *list) {
             used += 9;
         }
 
-        // GROUP
         if (!opts.omit_group) {
             if (opts.numeric_ids) {
                 printf("%s%-8u%s ", COLOR_CYAN, item->gid, COLOR_RESET);
@@ -484,7 +480,6 @@ static void draw_long_format(FileList *list) {
             }
         }
 
-        // SIZE
         char size_str[32];
         const char *size_col = COLOR_RESET;
         if (item->is_dir) {
@@ -499,7 +494,6 @@ static void draw_long_format(FileList *list) {
         printf("%s%10s%s  ", size_col, size_str, COLOR_RESET);
         used += 10 + 2;
 
-        // TIME
         char time_str[32];
         format_time(item->mtime, time_str, sizeof(time_str));
         double age = difftime(now, item->mtime);
@@ -507,7 +501,6 @@ static void draw_long_format(FileList *list) {
         printf("%s%-12s%s  ", tcol, time_str, COLOR_RESET);
         used += 12 + 2;
 
-        // ICON + NAME
         char icon = '-';
         const char *name_col = COLOR_RESET;
 
@@ -654,3 +647,4 @@ int main(int argc, char *argv[]) {
     if (opts.pattern) free(opts.pattern);
     return 0;
 }
+
