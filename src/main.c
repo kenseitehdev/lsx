@@ -11,6 +11,58 @@
 #include <locale.h>
 #include <errno.h>
 
+#include <wchar.h>
+#include <sys/ioctl.h>
+
+#include <fcntl.h>
+
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int term_width_from_fd(int fd) {
+    struct winsize ws;
+    if (fd >= 0 && isatty(fd) &&
+        ioctl(fd, TIOCGWINSZ, &ws) == 0 &&
+        ws.ws_col > 0)
+    {
+        return (int)ws.ws_col;
+    }
+    return 0;
+}
+
+static int get_term_width(void) {
+    // 1) Normal case
+    int w = term_width_from_fd(STDOUT_FILENO);
+    if (w) return clamp_int(w, 20, 1000);
+
+    // 2) watch exports COLUMNS/LINES for the child
+    const char *cols = getenv("COLUMNS");
+    if (cols && *cols) {
+        char *end = NULL;
+        long v = strtol(cols, &end, 10);
+        if (end != cols && v > 0) return clamp_int((int)v, 20, 1000);
+    }
+
+    // 3) Sometimes stdin/stderr are still TTYs
+    w = term_width_from_fd(STDIN_FILENO);
+    if (w) return clamp_int(w, 20, 1000);
+
+    w = term_width_from_fd(STDERR_FILENO);
+    if (w) return clamp_int(w, 20, 1000);
+
+    // 4) Last resort: ask the controlling terminal
+    int tty = open("/dev/tty", O_RDONLY);
+    if (tty >= 0) {
+        w = term_width_from_fd(tty);
+        close(tty);
+        if (w) return clamp_int(w, 20, 1000);
+    }
+
+    return 80; // safer fallback than 120
+}
 #define MAX_PATH 4096
 #define MAX_ITEMS 2048
 
@@ -96,6 +148,9 @@ static const char *GLYPH_BR = U8_BR;
 static const char *GLYPH_LJ = U8_LJ;
 static const char *GLYPH_RJ = U8_RJ;
 
+static void print_row_prefix(void) {
+    printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
+}
 static void init_glyphs(void) {
     const char *lc = setlocale(LC_CTYPE, NULL);
     const char *force = getenv("LSX_ASCII");
@@ -118,6 +173,71 @@ static void print_repeat(const char *s, int n) {
     for (int i = 0; i < n; i++) fputs(s, stdout);
 }
 
+// Count printable columns in a string that may include ANSI CSI escapes like "\x1b[...m".
+// Count printable terminal columns in a string that may include ANSI CSI escapes.
+// UTF-8 aware: uses mbrtowc + wcwidth to count columns correctly.
+static int visible_len_ansi(const char *s) {
+    mbstate_t st;
+    memset(&st, 0, sizeof(st));
+
+    int cols = 0;
+    size_t i = 0;
+
+    while (s[i]) {
+        // Skip ANSI escape sequences: ESC [ ... final
+        if (s[i] == '\x1b' && s[i + 1] == '[') {
+            i += 2;
+            while (s[i] && !(s[i] >= '@' && s[i] <= '~')) i++;
+            if (s[i]) i++; // consume final byte
+            continue;
+        }
+
+        // Decode next UTF-8 sequence into a wide char
+        wchar_t wc;
+        size_t n = mbrtowc(&wc, s + i, MB_CUR_MAX, &st);
+
+        if (n == (size_t)-2) {
+            // Incomplete multibyte sequence; treat remaining bytes as 1 col each
+            cols += 1;
+            i += 1;
+            memset(&st, 0, sizeof(st));
+            continue;
+        }
+        if (n == (size_t)-1) {
+            // Invalid byte sequence; count as 1 and move on
+            cols += 1;
+            i += 1;
+            memset(&st, 0, sizeof(st));
+            continue;
+        }
+        if (n == 0) {
+            // NUL
+            break;
+        }
+
+        int w = wcwidth(wc);
+        if (w < 0) w = 1; // non-printables fall back to 1
+
+        cols += w;
+        i += n;
+    }
+
+    return cols;
+}
+
+static void print_row_content(int width, const char *content) {
+    int inner = width - 2;
+    if (inner < 1) inner = 1;
+
+    int vis = visible_len_ansi(content);
+    int padding = inner - (1 + vis); // +1 because print_row_prefix prints "│ " (space after)
+    if (padding < 0) padding = 0;
+
+    print_row_prefix();          // prints left border + space
+    fputs(content, stdout);      // prints colored content
+    for (int i = 0; i < padding; i++) putchar(' ');
+    printf("%s%s%s\n", COLOR_WHITE, GLYPH_V, COLOR_RESET); // right border
+}
 static void print_border_top(int width) {
     printf("%s%s", COLOR_WHITE, GLYPH_TL);
     print_repeat(GLYPH_H, width - 2);
@@ -136,9 +256,6 @@ static void print_border_bottom(int width) {
     printf("%s%s\n", GLYPH_BR, COLOR_RESET);
 }
 
-static void print_row_prefix(void) {
-    printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
-}
 
 static void print_row_suffix(int width, int used_visible_cols) {
     int inner = width - 2;
@@ -288,33 +405,6 @@ static void format_time(time_t t, char *str, size_t len) {
     strftime(str, len, "%b %d %H:%M", tmv);
 }
 
-static void print_perms_colored(mode_t mode) {
-    char t = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
-    const char *tcol = S_ISDIR(mode) ? (COLOR_CYAN COLOR_BOLD)
-                    : S_ISLNK(mode) ? (COLOR_MAGENTA COLOR_BOLD)
-                    : (COLOR_DIM COLOR_GRAY);
-    printf("%s%c%s", tcol, t, COLOR_RESET);
-
-    const mode_t bits[9] = {
-        S_IRUSR, S_IWUSR, S_IXUSR,
-        S_IRGRP, S_IWGRP, S_IXGRP,
-        S_IROTH, S_IWOTH, S_IXOTH
-    };
-
-    for (int i = 0; i < 9; i++) {
-        char ch;
-        if (mode & bits[i]) ch = (i % 3 == 0) ? 'r' : (i % 3 == 1) ? 'w' : 'x';
-        else ch = '-';
-
-        const char *c =
-            (ch == 'r') ? COLOR_GREEN :
-            (ch == 'w') ? COLOR_YELLOW :
-            (ch == 'x') ? (COLOR_RED COLOR_BOLD) :
-            (COLOR_DIM COLOR_GRAY);
-
-        printf("%s%c%s", c, ch, COLOR_RESET);
-    }
-}
 
 static void make_indent_prefix(char *out, size_t outsz, int level, int is_last) {
     // Simple tree-ish indent that still prints as plain text inside your box.
@@ -341,7 +431,9 @@ static void make_indent_prefix(char *out, size_t outsz, int level, int is_last) 
     }
 }
 
-static void print_item_simple_line(FileItem *item, int width, const char *prefix, int prefix_visible) {
+static void print_item_simple_line(FileItem *item, int width, const char *prefix, int prefix_visible_unused) {
+    (void)prefix_visible_unused;
+
     const char *name_col = COLOR_RESET;
     char icon = '-';
 
@@ -350,128 +442,181 @@ static void print_item_simple_line(FileItem *item, int width, const char *prefix
     else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
     else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
 
-    print_row_prefix();
-    int used = 1;
+    char row[8192];
+    row[0] = '\0';
 
     if (prefix && *prefix) {
-        fputs(COLOR_DIM COLOR_GRAY, stdout);
-        fputs(prefix, stdout);
-        fputs(COLOR_RESET, stdout);
-        used += prefix_visible;
+        snprintf(row + strlen(row), sizeof(row) - strlen(row),
+                 "%s%s%s", COLOR_DIM COLOR_GRAY, prefix, COLOR_RESET);
     }
 
-    printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
-    used += 2;
+    snprintf(row + strlen(row), sizeof(row) - strlen(row),
+             "%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
 
-    printf("%s", name_col);
     if (opts.quote_names) {
-        printf("\"%s\"", item->name);
-        used += (int)strlen(item->name) + 2;
+        snprintf(row + strlen(row), sizeof(row) - strlen(row),
+                 "%s\"%s\"%s", name_col, item->name, COLOR_RESET);
     } else {
-        printf("%s", item->name);
-        used += (int)strlen(item->name);
+        snprintf(row + strlen(row), sizeof(row) - strlen(row),
+                 "%s%s%s", name_col, item->name, COLOR_RESET);
     }
 
     if (opts.add_slash && item->is_dir) {
-        printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET);
-        used += 1;
+        snprintf(row + strlen(row), sizeof(row) - strlen(row),
+                 "%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET);
     }
 
-    printf("%s", COLOR_RESET);
-    print_row_suffix(width, used);
+    print_row_content(width, row);
 }
 
-static void print_item_long_line(FileItem *item, int width, const char *prefix, int prefix_visible) {
+static void print_item_long_line(FileItem *item, int width, const char *prefix, int prefix_visible_unused) {
+    (void)prefix_visible_unused;
+
     time_t now = time(NULL);
 
-    print_row_prefix();
-    int used = 1;
+    char row[8192];
+    row[0] = '\0';
 
     if (prefix && *prefix) {
-        fputs(COLOR_DIM COLOR_GRAY, stdout);
-        fputs(prefix, stdout);
-        fputs(COLOR_RESET, stdout);
-        used += prefix_visible;
+        snprintf(row + strlen(row), sizeof(row) - strlen(row),
+                 "%s%s%s", COLOR_DIM COLOR_GRAY, prefix, COLOR_RESET);
     }
 
     if (opts.show_inode) {
-        printf("%s%-8llu%s ", COLOR_MAGENTA, (unsigned long long)item->inode, COLOR_RESET);
-        used += 9;
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%s%-8llu%s ",
+                 COLOR_MAGENTA, (unsigned long long)item->inode, COLOR_RESET);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
     }
 
-    print_perms_colored(item->mode);
-    printf(" ");
-    used += 11;
+    // perms (write into row using a temp buffer)
+    {
+        char perm[128];
+        char t = S_ISDIR(item->mode) ? 'd' : S_ISLNK(item->mode) ? 'l' : '-';
+        const char *tcol = S_ISDIR(item->mode) ? (COLOR_CYAN COLOR_BOLD)
+                        : S_ISLNK(item->mode) ? (COLOR_MAGENTA COLOR_BOLD)
+                        : (COLOR_DIM COLOR_GRAY);
 
+        snprintf(perm, sizeof(perm), "%s%c%s", tcol, t, COLOR_RESET);
+        strncat(row, perm, sizeof(row) - strlen(row) - 1);
+
+        const mode_t bits[9] = {
+            S_IRUSR, S_IWUSR, S_IXUSR,
+            S_IRGRP, S_IWGRP, S_IXGRP,
+            S_IROTH, S_IWOTH, S_IXOTH
+        };
+
+        for (int i = 0; i < 9; i++) {
+            char ch;
+            if (item->mode & bits[i]) ch = (i % 3 == 0) ? 'r' : (i % 3 == 1) ? 'w' : 'x';
+            else ch = '-';
+
+            const char *c =
+                (ch == 'r') ? COLOR_GREEN :
+                (ch == 'w') ? COLOR_YELLOW :
+                (ch == 'x') ? (COLOR_RED COLOR_BOLD) :
+                (COLOR_DIM COLOR_GRAY);
+
+            char one[32];
+            snprintf(one, sizeof(one), "%s%c%s", c, ch, COLOR_RESET);
+            strncat(row, one, sizeof(row) - strlen(row) - 1);
+        }
+
+        strncat(row, " ", sizeof(row) - strlen(row) - 1);
+    }
+
+    // owner / group
     if (opts.numeric_ids) {
-        printf("%s%-8u%s ", COLOR_CYAN, item->uid, COLOR_RESET);
-        used += 9;
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s%-8u%s ", COLOR_CYAN, item->uid, COLOR_RESET);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
+
+        if (!opts.omit_group) {
+            snprintf(tmp, sizeof(tmp), "%s%-8u%s ", COLOR_CYAN, item->gid, COLOR_RESET);
+            strncat(row, tmp, sizeof(row) - strlen(row) - 1);
+        }
     } else {
         struct passwd *pw = getpwuid(item->uid);
         char owner[9];
         if (pw) snprintf(owner, sizeof(owner), "%-.8s", pw->pw_name);
         else snprintf(owner, sizeof(owner), "%u", item->uid);
-        printf("%s%-8s%s ", COLOR_CYAN, owner, COLOR_RESET);
-        used += 9;
-    }
 
-    if (!opts.omit_group) {
-        if (opts.numeric_ids) {
-            printf("%s%-8u%s ", COLOR_CYAN, item->gid, COLOR_RESET);
-            used += 9;
-        } else {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s%-8s%s ", COLOR_CYAN, owner, COLOR_RESET);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
+
+        if (!opts.omit_group) {
             struct group *gr = getgrgid(item->gid);
             char group[9];
             if (gr) snprintf(group, sizeof(group), "%-.8s", gr->gr_name);
             else snprintf(group, sizeof(group), "%u", item->gid);
-            printf("%s%-8s%s ", COLOR_CYAN, group, COLOR_RESET);
-            used += 9;
+
+            snprintf(tmp, sizeof(tmp), "%s%-8s%s ", COLOR_CYAN, group, COLOR_RESET);
+            strncat(row, tmp, sizeof(row) - strlen(row) - 1);
         }
     }
 
-    char size_str[32];
-    const char *size_col = COLOR_RESET;
-    if (item->is_dir) {
-        snprintf(size_str, sizeof(size_str), "<DIR>");
-        size_col = COLOR_CYAN COLOR_BOLD;
-    } else {
-        format_size(item->size, size_str, sizeof(size_str));
-        if (item->size >= (off_t)1024 * 1024 * 1024) size_col = COLOR_RED COLOR_BOLD;
-        else if (item->size >= (off_t)1024 * 1024 * 50) size_col = COLOR_YELLOW COLOR_BOLD;
-        else size_col = COLOR_GREEN;
+    // size
+    {
+        char size_str[32];
+        const char *size_col = COLOR_RESET;
+        if (item->is_dir) {
+            snprintf(size_str, sizeof(size_str), "<DIR>");
+            size_col = COLOR_CYAN COLOR_BOLD;
+        } else {
+            format_size(item->size, size_str, sizeof(size_str));
+            if (item->size >= (off_t)1024 * 1024 * 1024) size_col = COLOR_RED COLOR_BOLD;
+            else if (item->size >= (off_t)1024 * 1024 * 50) size_col = COLOR_YELLOW COLOR_BOLD;
+            else size_col = COLOR_GREEN;
+        }
+
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s%10s%s  ", size_col, size_str, COLOR_RESET);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
     }
-    printf("%s%10s%s  ", size_col, size_str, COLOR_RESET);
-    used += 10 + 2;
 
-    char time_str[32];
-    format_time(item->mtime, time_str, sizeof(time_str));
-    double age = difftime(now, item->mtime);
-    const char *tcol = (age < 60 * 60 * 24 * 2) ? (COLOR_GREEN COLOR_BOLD) : (COLOR_DIM COLOR_GRAY);
-    printf("%s%-12s%s  ", tcol, time_str, COLOR_RESET);
-    used += 12 + 2;
+    // time
+    {
+        char time_str[32];
+        format_time(item->mtime, time_str, sizeof(time_str));
+        double age = difftime(now, item->mtime);
+        const char *tcol = (age < 60 * 60 * 24 * 2) ? (COLOR_GREEN COLOR_BOLD) : (COLOR_DIM COLOR_GRAY);
 
-    char icon = '-';
-    const char *name_col = COLOR_RESET;
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s%-12s%s  ", tcol, time_str, COLOR_RESET);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
+    }
 
-    if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
-    else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
-    else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
-    else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
+    // icon + name
+    {
+        char icon = '-';
+        const char *name_col = COLOR_RESET;
 
-    printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
-    used += 2;
+        if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
+        else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
+        else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
+        else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
 
-    printf("%s", name_col);
-    if (opts.quote_names) { printf("\"%s\"", item->name); used += (int)strlen(item->name) + 2; }
-    else { printf("%s", item->name); used += (int)strlen(item->name); }
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "%s%c%s %s%s%s",
+                 COLOR_WHITE, icon, COLOR_RESET,
+                 name_col,
+                 opts.quote_names ? "\"" : "",
+                 item->name);
+        strncat(row, tmp, sizeof(row) - strlen(row) - 1);
 
-    if (opts.add_slash && item->is_dir) { printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET); used += 1; }
-    printf("%s", COLOR_RESET);
+        if (opts.quote_names) strncat(row, "\"", sizeof(row) - strlen(row) - 1);
 
-    print_row_suffix(width, used);
+        if (opts.add_slash && item->is_dir) {
+            strncat(row, COLOR_DIM COLOR_GRAY "/", sizeof(row) - strlen(row) - 1);
+            strncat(row, COLOR_RESET, sizeof(row) - strlen(row) - 1);
+        } else {
+            strncat(row, COLOR_RESET, sizeof(row) - strlen(row) - 1);
+        }
+    }
+
+    print_row_content(width, row);
 }
-
-
 static void emit_directory_children_inline(const char *dir_path, int level, int width) {
     if (opts.depth <= 0) return;
     if (level > opts.depth) return;   // also fixes -D 1 behavior
@@ -560,8 +705,8 @@ static void draw_long_header_row(int width) {
 }
 
 static void draw_single_box_listing(const char *target_path) {
-    int width = 120;
-
+    int width = get_term_width();
+    printf("width %d\n",width);
     FileList *list = (FileList *)calloc(1, sizeof(*list));
     if (!list) return;
 
