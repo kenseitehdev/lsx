@@ -28,34 +28,22 @@
 #define COLOR_DIM      "\033[2m"
 
 typedef struct {
-    int show_hidden;      
+    int show_hidden;
+    int long_format;
+    int human_readable;
+    int omit_group;
+    int add_slash;
+    int show_inode;
+    int recursive;        // existing -R (kept)
+    int reverse;
+    int sort_by_ext;
+    int sort_by_time;
+    int numeric_ids;
+    int comma_separated;
+    int quote_names;
+    char *pattern;
 
-    int long_format;      
-
-    int human_readable;   
-
-    int omit_group;       
-
-    int add_slash;        
-
-    int show_inode;       
-
-    int recursive;        
-
-    int reverse;          
-
-    int sort_by_ext;      
-
-    int sort_by_time;     
-
-    int numeric_ids;      
-
-    int comma_separated;  
-
-    int quote_names;      
-
-    char *pattern;        
-
+    int depth;            // NEW: inline depth inside one box (0 = off)
 } Options;
 
 typedef struct {
@@ -81,21 +69,14 @@ static Options opts = {0};
 
 static int g_use_utf8 = 1;
 
-#define U8_H  "\xE2\x94\x80" 
-
-#define U8_V  "\xE2\x94\x82" 
-
-#define U8_TL "\xE2\x94\x8C" 
-
-#define U8_TR "\xE2\x94\x90" 
-
-#define U8_BL "\xE2\x94\x94" 
-
-#define U8_BR "\xE2\x94\x98" 
-
-#define U8_LJ "\xE2\x94\x9C" 
-
-#define U8_RJ "\xE2\x94\xA4" 
+#define U8_H  "\xE2\x94\x80"
+#define U8_V  "\xE2\x94\x82"
+#define U8_TL "\xE2\x94\x8C"
+#define U8_TR "\xE2\x94\x90"
+#define U8_BL "\xE2\x94\x94"
+#define U8_BR "\xE2\x94\x98"
+#define U8_LJ "\xE2\x94\x9C"
+#define U8_RJ "\xE2\x94\xA4"
 
 #define A_H  "-"
 #define A_V  "|"
@@ -156,7 +137,6 @@ static void print_border_bottom(int width) {
 }
 
 static void print_row_prefix(void) {
-
     printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
 }
 
@@ -336,73 +316,214 @@ static void print_perms_colored(mode_t mode) {
     }
 }
 
-static void draw_simple_box(FileList *list) {
-    int width = 120;
+static void make_indent_prefix(char *out, size_t outsz, int level, int is_last) {
+    // Simple tree-ish indent that still prints as plain text inside your box.
+    // Example: "  ├─ " / "  └─ " repeated by level
+    out[0] = '\0';
+    if (level <= 0) return;
 
-    print_border_top(width);
-
-    printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
-    printf("%s%slsx%s %s", COLOR_BG_CYAN, COLOR_BOLD, COLOR_RESET, list->cwd);
-    int title_visible = 1 + (int)strlen("lsx ") + (int)strlen(list->cwd);
-    print_row_suffix(width, title_visible);
-
-    print_border_mid(width);
-
-    for (int i = 0; i < list->count; i++) {
-        FileItem *item = &list->items[i];
-
-        const char *name_col = COLOR_RESET;
-        char icon = '-';
-
-        if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
-        else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
-        else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
-        else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
-
-        print_row_prefix();
-        int used = 1;
-
-        printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
-        used += 2;
-
-        printf("%s", name_col);
-        if (opts.quote_names) {
-            printf("\"%s\"", item->name);
-            used += (int)strlen(item->name) + 2;
-        } else {
-            printf("%s", item->name);
-            used += (int)strlen(item->name);
-        }
-
-        if (opts.add_slash && item->is_dir) {
-            printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET);
-            used += 1;
-        }
-
-        printf("%s", COLOR_RESET);
-
-        print_row_suffix(width, used);
+    size_t used = 0;
+    for (int i = 0; i < level - 1; i++) {
+        const char *seg = g_use_utf8 ? "  " : "  ";
+        size_t seglen = strlen(seg);
+        if (used + seglen + 1 >= outsz) break;
+        memcpy(out + used, seg, seglen);
+        used += seglen;
+        out[used] = '\0';
     }
 
-    print_border_bottom(width);
-    printf("%s  %d items total%s\n", COLOR_DIM COLOR_GRAY, list->count, COLOR_RESET);
+    const char *branch = g_use_utf8 ? (is_last ? "  └─ " : "  ├─ ") : (is_last ? "  `- " : "  |- ");
+    size_t blen = strlen(branch);
+    if (used + blen + 1 < outsz) {
+        memcpy(out + used, branch, blen);
+        used += blen;
+        out[used] = '\0';
+    }
 }
 
-static void draw_long_format(FileList *list) {
-    int width = 120;
+static void print_item_simple_line(FileItem *item, int width, const char *prefix, int prefix_visible) {
+    const char *name_col = COLOR_RESET;
+    char icon = '-';
 
-    print_border_top(width);
-
-    printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
-    printf("%s%slsx%s %s", COLOR_BG_CYAN, COLOR_BOLD, COLOR_RESET, list->cwd);
-    int title_visible = 1 + (int)strlen("lsx ") + (int)strlen(list->cwd);
-    print_row_suffix(width, title_visible);
-
-    print_border_mid(width);
+    if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
+    else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
+    else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
+    else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
 
     print_row_prefix();
     int used = 1;
 
+    if (prefix && *prefix) {
+        fputs(COLOR_DIM COLOR_GRAY, stdout);
+        fputs(prefix, stdout);
+        fputs(COLOR_RESET, stdout);
+        used += prefix_visible;
+    }
+
+    printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
+    used += 2;
+
+    printf("%s", name_col);
+    if (opts.quote_names) {
+        printf("\"%s\"", item->name);
+        used += (int)strlen(item->name) + 2;
+    } else {
+        printf("%s", item->name);
+        used += (int)strlen(item->name);
+    }
+
+    if (opts.add_slash && item->is_dir) {
+        printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET);
+        used += 1;
+    }
+
+    printf("%s", COLOR_RESET);
+    print_row_suffix(width, used);
+}
+
+static void print_item_long_line(FileItem *item, int width, const char *prefix, int prefix_visible) {
+    time_t now = time(NULL);
+
+    print_row_prefix();
+    int used = 1;
+
+    if (prefix && *prefix) {
+        fputs(COLOR_DIM COLOR_GRAY, stdout);
+        fputs(prefix, stdout);
+        fputs(COLOR_RESET, stdout);
+        used += prefix_visible;
+    }
+
+    if (opts.show_inode) {
+        printf("%s%-8llu%s ", COLOR_MAGENTA, (unsigned long long)item->inode, COLOR_RESET);
+        used += 9;
+    }
+
+    print_perms_colored(item->mode);
+    printf(" ");
+    used += 11;
+
+    if (opts.numeric_ids) {
+        printf("%s%-8u%s ", COLOR_CYAN, item->uid, COLOR_RESET);
+        used += 9;
+    } else {
+        struct passwd *pw = getpwuid(item->uid);
+        char owner[9];
+        if (pw) snprintf(owner, sizeof(owner), "%-.8s", pw->pw_name);
+        else snprintf(owner, sizeof(owner), "%u", item->uid);
+        printf("%s%-8s%s ", COLOR_CYAN, owner, COLOR_RESET);
+        used += 9;
+    }
+
+    if (!opts.omit_group) {
+        if (opts.numeric_ids) {
+            printf("%s%-8u%s ", COLOR_CYAN, item->gid, COLOR_RESET);
+            used += 9;
+        } else {
+            struct group *gr = getgrgid(item->gid);
+            char group[9];
+            if (gr) snprintf(group, sizeof(group), "%-.8s", gr->gr_name);
+            else snprintf(group, sizeof(group), "%u", item->gid);
+            printf("%s%-8s%s ", COLOR_CYAN, group, COLOR_RESET);
+            used += 9;
+        }
+    }
+
+    char size_str[32];
+    const char *size_col = COLOR_RESET;
+    if (item->is_dir) {
+        snprintf(size_str, sizeof(size_str), "<DIR>");
+        size_col = COLOR_CYAN COLOR_BOLD;
+    } else {
+        format_size(item->size, size_str, sizeof(size_str));
+        if (item->size >= (off_t)1024 * 1024 * 1024) size_col = COLOR_RED COLOR_BOLD;
+        else if (item->size >= (off_t)1024 * 1024 * 50) size_col = COLOR_YELLOW COLOR_BOLD;
+        else size_col = COLOR_GREEN;
+    }
+    printf("%s%10s%s  ", size_col, size_str, COLOR_RESET);
+    used += 10 + 2;
+
+    char time_str[32];
+    format_time(item->mtime, time_str, sizeof(time_str));
+    double age = difftime(now, item->mtime);
+    const char *tcol = (age < 60 * 60 * 24 * 2) ? (COLOR_GREEN COLOR_BOLD) : (COLOR_DIM COLOR_GRAY);
+    printf("%s%-12s%s  ", tcol, time_str, COLOR_RESET);
+    used += 12 + 2;
+
+    char icon = '-';
+    const char *name_col = COLOR_RESET;
+
+    if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
+    else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
+    else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
+    else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
+
+    printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
+    used += 2;
+
+    printf("%s", name_col);
+    if (opts.quote_names) { printf("\"%s\"", item->name); used += (int)strlen(item->name) + 2; }
+    else { printf("%s", item->name); used += (int)strlen(item->name); }
+
+    if (opts.add_slash && item->is_dir) { printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET); used += 1; }
+    printf("%s", COLOR_RESET);
+
+    print_row_suffix(width, used);
+}
+
+
+static void emit_directory_children_inline(const char *dir_path, int level, int width) {
+    if (opts.depth <= 0) return;
+    if (level > opts.depth) return;   // also fixes -D 1 behavior
+
+    FileList *list = calloc(1, sizeof(*list));
+    if (!list) return;
+
+    if (load_directory(list, dir_path) != 0) {
+        free(list);
+        return;
+    }
+
+    sort_list(list);
+
+    for (int i = 0; i < list->count; i++) {
+        FileItem *child = &list->items[i];
+
+        if (strcmp(child->name, ".") == 0 || strcmp(child->name, "..") == 0) continue;
+
+        int is_last = (i == list->count - 1);
+
+        char prefix[256];
+        make_indent_prefix(prefix, sizeof(prefix), level, is_last);
+        int prefix_visible = (int)strlen(prefix);
+
+        if (opts.long_format) print_item_long_line(child, width, prefix, prefix_visible);
+        else                 print_item_simple_line(child, width, prefix, prefix_visible);
+
+        if (child->is_dir) {
+            emit_directory_children_inline(child->full_path, level + 1, width);
+        }
+    }
+
+    free(list);
+}
+
+static void draw_header(FileList *list, int width) {
+    print_border_top(width);
+
+    printf("%s%s%s ", COLOR_WHITE, GLYPH_V, COLOR_RESET);
+    printf("%s%slsx%s %s", COLOR_BG_CYAN, COLOR_BOLD, COLOR_RESET, list->cwd);
+    int title_visible = 1 + (int)strlen("lsx ") + (int)strlen(list->cwd);
+    print_row_suffix(width, title_visible);
+
+    print_border_mid(width);
+}
+
+static void draw_long_header_row(int width) {
+    print_row_prefix();
+    int used = 1;
+
+    // no prefix column in header; nested items will insert a prefix before inode/perms, etc.
     if (opts.show_inode) {
         printf("%s%-8s%s ", COLOR_YELLOW COLOR_BOLD, "INODE", COLOR_RESET);
         used += 9;
@@ -436,118 +557,26 @@ static void draw_long_format(FileList *list) {
     print_row_suffix(width, used);
 
     print_border_mid(width);
-
-    time_t now = time(NULL);
-
-    for (int i = 0; i < list->count; i++) {
-        FileItem *item = &list->items[i];
-
-        print_row_prefix();
-        used = 1;
-
-        if (opts.show_inode) {
-            printf("%s%-8llu%s ", COLOR_MAGENTA, (unsigned long long)item->inode, COLOR_RESET);
-            used += 9;
-        }
-
-        print_perms_colored(item->mode);
-        printf(" ");
-        used += 11;
-
-        if (opts.numeric_ids) {
-            printf("%s%-8u%s ", COLOR_CYAN, item->uid, COLOR_RESET);
-            used += 9;
-        } else {
-            struct passwd *pw = getpwuid(item->uid);
-            char owner[9];
-            if (pw) snprintf(owner, sizeof(owner), "%-.8s", pw->pw_name);
-            else snprintf(owner, sizeof(owner), "%u", item->uid);
-            printf("%s%-8s%s ", COLOR_CYAN, owner, COLOR_RESET);
-            used += 9;
-        }
-
-        if (!opts.omit_group) {
-            if (opts.numeric_ids) {
-                printf("%s%-8u%s ", COLOR_CYAN, item->gid, COLOR_RESET);
-                used += 9;
-            } else {
-                struct group *gr = getgrgid(item->gid);
-                char group[9];
-                if (gr) snprintf(group, sizeof(group), "%-.8s", gr->gr_name);
-                else snprintf(group, sizeof(group), "%u", item->gid);
-                printf("%s%-8s%s ", COLOR_CYAN, group, COLOR_RESET);
-                used += 9;
-            }
-        }
-
-        char size_str[32];
-        const char *size_col = COLOR_RESET;
-        if (item->is_dir) {
-            snprintf(size_str, sizeof(size_str), "<DIR>");
-            size_col = COLOR_CYAN COLOR_BOLD;
-        } else {
-            format_size(item->size, size_str, sizeof(size_str));
-            if (item->size >= (off_t)1024 * 1024 * 1024) size_col = COLOR_RED COLOR_BOLD;
-            else if (item->size >= (off_t)1024 * 1024 * 50) size_col = COLOR_YELLOW COLOR_BOLD;
-            else size_col = COLOR_GREEN;
-        }
-        printf("%s%10s%s  ", size_col, size_str, COLOR_RESET);
-        used += 10 + 2;
-
-        char time_str[32];
-        format_time(item->mtime, time_str, sizeof(time_str));
-        double age = difftime(now, item->mtime);
-        const char *tcol = (age < 60 * 60 * 24 * 2) ? (COLOR_GREEN COLOR_BOLD) : (COLOR_DIM COLOR_GRAY);
-        printf("%s%-12s%s  ", tcol, time_str, COLOR_RESET);
-        used += 12 + 2;
-
-        char icon = '-';
-        const char *name_col = COLOR_RESET;
-
-        if (item->is_dir) { icon = 'D'; name_col = COLOR_CYAN COLOR_BOLD; }
-        else if (S_ISLNK(item->mode)) { icon = '@'; name_col = COLOR_MAGENTA COLOR_BOLD; }
-        else if (item->mode & S_IXUSR) { icon = '*'; name_col = COLOR_GREEN COLOR_BOLD; }
-        else if (item->is_hidden) { icon = '.'; name_col = COLOR_DIM COLOR_MAGENTA; }
-
-        printf("%s%c%s ", COLOR_WHITE, icon, COLOR_RESET);
-        used += 2;
-
-        printf("%s", name_col);
-        if (opts.quote_names) { printf("\"%s\"", item->name); used += (int)strlen(item->name) + 2; }
-        else { printf("%s", item->name); used += (int)strlen(item->name); }
-
-        if (opts.add_slash && item->is_dir) { printf("%s/%s", COLOR_DIM COLOR_GRAY, COLOR_RESET); used += 1; }
-        printf("%s", COLOR_RESET);
-
-        print_row_suffix(width, used);
-    }
-
-    print_border_bottom(width);
-    printf("%s  %d items total%s\n", COLOR_DIM COLOR_GRAY, list->count, COLOR_RESET);
 }
 
-static void list_directory_recursive(const char *path, int depth) {
+static void draw_single_box_listing(const char *target_path) {
+    int width = 120;
+
     FileList *list = (FileList *)calloc(1, sizeof(*list));
     if (!list) return;
 
-    if (load_directory(list, path) != 0) {
+    if (load_directory(list, target_path) != 0) {
         if (errno == ENOTDIR) {
-            if (load_single_file(list, path) != 0) { free(list); return; }
+            if (load_single_file(list, target_path) != 0) { free(list); return; }
         } else {
-            if (load_single_file(list, path) != 0) { free(list); return; }
+            if (load_single_file(list, target_path) != 0) { free(list); return; }
         }
     }
 
     sort_list(list);
 
-    if (depth > 0) {
-        printf("\n");
-        printf("%s%s%s:%s\n", COLOR_YELLOW, COLOR_BOLD, path, COLOR_RESET);
-    }
-
-    if (opts.long_format) {
-        draw_long_format(list);
-    } else if (opts.comma_separated) {
+    // COMMA MODE: keep your original behavior (no boxes); depth doesn't apply here.
+    if (opts.comma_separated) {
         for (int i = 0; i < list->count; i++) {
             FileItem *item = &list->items[i];
             const char *color = COLOR_RESET;
@@ -562,20 +591,43 @@ static void list_directory_recursive(const char *path, int depth) {
             if (i < list->count - 1) printf(", ");
         }
         printf("\n");
-    } else {
-        draw_simple_box(list);
+        if (opts.pattern) { /* freed in main */ }
+        free(list);
+        return;
     }
 
-    if (opts.recursive) {
+    // Draw ONE box header
+    draw_header(list, width);
+
+    if (opts.long_format) {
+        draw_long_header_row(width);
+
         for (int i = 0; i < list->count; i++) {
             FileItem *item = &list->items[i];
-            if (item->is_dir &&
-                strcmp(item->name, ".") != 0 &&
-                strcmp(item->name, "..") != 0) {
-                list_directory_recursive(item->full_path, depth + 1);
+            print_item_long_line(item, width, "", 0);
+
+            // Inline children (depth)
+            if (opts.depth > 0 && item->is_dir &&
+                strcmp(item->name, ".") != 0 && strcmp(item->name, "..") != 0) {
+                emit_directory_children_inline(item->full_path, 1, width);
+            }
+        }
+
+    } else {
+        for (int i = 0; i < list->count; i++) {
+            FileItem *item = &list->items[i];
+            print_item_simple_line(item, width, "", 0);
+
+            // Inline children (depth)
+            if (opts.depth > 0 && item->is_dir &&
+                strcmp(item->name, ".") != 0 && strcmp(item->name, "..") != 0) {
+                emit_directory_children_inline(item->full_path, 1, width);
             }
         }
     }
+
+    print_border_bottom(width);
+    printf("%s  %d items total%s\n", COLOR_DIM COLOR_GRAY, list->count, COLOR_RESET);
 
     free(list);
 }
@@ -583,22 +635,29 @@ static void list_directory_recursive(const char *path, int depth) {
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [OPTIONS] [DIRECTORY|FILE]\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -a        Show all files including hidden\n");
-    fprintf(stderr, "  -l        Long format (table)\n");
-    fprintf(stderr, "  -h        Human readable sizes (with -l)\n");
-    fprintf(stderr, "  -g        Omit group column\n");
-    fprintf(stderr, "  -F        Add slash to directories\n");
-    fprintf(stderr, "  -i        Show inode numbers\n");
-    fprintf(stderr, "  -R        Recursive listing\n");
-    fprintf(stderr, "  -r        Reverse sort order\n");
-    fprintf(stderr, "  -X        Sort by extension\n");
-    fprintf(stderr, "  -t        Sort by modification time\n");
-    fprintf(stderr, "  -n        Show numeric UIDs/GIDs\n");
-    fprintf(stderr, "  -m        Comma-separated output\n");
-    fprintf(stderr, "  -Q        Quote filenames\n");
+    fprintf(stderr, "  -a            Show all files including hidden\n");
+    fprintf(stderr, "  -l            Long format (table)\n");
+    fprintf(stderr, "  -h            Human readable sizes (with -l)\n");
+    fprintf(stderr, "  -g            Omit group column\n");
+    fprintf(stderr, "  -F            Add slash to directories\n");
+    fprintf(stderr, "  -i            Show inode numbers\n");
+    fprintf(stderr, "  -R            Recursive listing (infinite inline depth)\n");
+    fprintf(stderr, "  -D N          Inline depth inside ONE box (like tree -L). Example: -D 5\n");
+    fprintf(stderr, "  --depth N     Same as -D\n");
+    fprintf(stderr, "  -r            Reverse sort order\n");
+    fprintf(stderr, "  -X            Sort by extension\n");
+    fprintf(stderr, "  -t            Sort by modification time\n");
+    fprintf(stderr, "  -n            Show numeric UIDs/GIDs\n");
+    fprintf(stderr, "  -m            Comma-separated output\n");
+    fprintf(stderr, "  -Q            Quote filenames\n");
     fprintf(stderr, "\nEnvironment:\n");
     fprintf(stderr, "  LSX_ASCII=1   Force ASCII borders (no UTF-8 box drawing)\n");
 }
+
+static struct option long_opts[] = {
+    {"depth", required_argument, 0, 'D'},
+    {0, 0, 0, 0}
+};
 
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
@@ -607,7 +666,9 @@ int main(int argc, char *argv[]) {
     int opt;
     char cwd[MAX_PATH];
 
-    while ((opt = getopt(argc, argv, "alhgFiRrXtnmQ")) != -1) {
+    opts.depth = 0;
+
+    while ((opt = getopt_long(argc, argv, "alhgFiRrXtnmQD:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'a': opts.show_hidden = 1; break;
             case 'l': opts.long_format = 1; break;
@@ -622,10 +683,26 @@ int main(int argc, char *argv[]) {
             case 'n': opts.numeric_ids = 1; break;
             case 'm': opts.comma_separated = 1; break;
             case 'Q': opts.quote_names = 1; break;
+
+            case 'D': {
+                int d = atoi(optarg);
+                if (d < 0) {
+                    fprintf(stderr, "lsx: --depth must be >= 0\n");
+                    return 1;
+                }
+                opts.depth = d;
+                break;
+            }
+
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    // Make -R enable infinite inline depth
+    if (opts.recursive && opts.depth == 0) {
+        opts.depth = 999;
     }
 
     const char *target = ".";
@@ -642,9 +719,8 @@ int main(int argc, char *argv[]) {
         target = cwd;
     }
 
-    list_directory_recursive(target, 0);
+    draw_single_box_listing(target);
 
     if (opts.pattern) free(opts.pattern);
     return 0;
 }
-

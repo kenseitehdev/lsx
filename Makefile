@@ -44,7 +44,8 @@ PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
 # OS-specific setup (forced)
 # -----------------------------
 .PHONY: setup-macos setup-linux
-
+setup-macos: | $(BUILD_DIR)
+setup-linux: | $(BUILD_DIR)
 setup-macos:
 	@# Prefer Homebrew ncursesw if installed
 	@if [ -n "$(BREW_NCURSES_PREFIX)" ]; then \
@@ -142,7 +143,7 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR)
+	rm -rf $(BUILD_DIR)/* $(BIN_DIR)/*
 	@echo "Cleaned build artifacts"
 
 install: release
