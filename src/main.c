@@ -706,7 +706,6 @@ static void draw_long_header_row(int width) {
 
 static void draw_single_box_listing(const char *target_path) {
     int width = get_term_width();
-    printf("width %d\n",width);
     FileList *list = (FileList *)calloc(1, sizeof(*list));
     if (!list) return;
 
